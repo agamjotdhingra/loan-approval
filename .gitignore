@@ -1,0 +1,5 @@
+.DS_Store
+.freebuff/
+.venv/
+__pycache__/
+*.pyc
