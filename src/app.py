@@ -8,10 +8,10 @@ WHAT THE APP DOES
 -----------------
 1. A form where you enter an applicant's details exactly as a bank officer
    would (income, credit history, property area...).
-2. Both trained pipelines (saved by train_and_evaluate.py) predict
+2. All three trained pipelines (saved by train_and_evaluate.py) predict
    Approved / Rejected for those details, with a confidence percentage.
-3. Both models' answers appear side by side - the live version of the
-   project's "Logistic Regression vs Decision Tree" comparison.
+3. The answers appear side by side (the selected best model is marked),
+   plus the engineered affordability features computed for the applicant.
 
 A KEY SIMPLIFICATION since the Pipeline rewrite: the app now sends RAW,
 human-readable values (e.g. "Graduate", "Urban") straight into the saved
@@ -20,11 +20,17 @@ as it did during training - one more benefit of wrapping preprocessing and
 model in a single object.
 """
 
+import glob
 import os
 import pickle
+import sys
 
 import pandas as pd
 import streamlit as st
+
+# the saved pipelines reference features.py, so src/ must be importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from features import add_engineered_features  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(PROJECT_ROOT, "output", "models")
@@ -39,16 +45,19 @@ FEATURE_ORDER = [
 ]
 
 
+st.set_page_config(page_title="Loan Approval Prediction", page_icon="🏦", layout="wide")
+
+
 @st.cache_resource(show_spinner="Loading trained models...")
 def load_models() -> dict:
-    """Load both pickled pipelines ONCE (cache = no re-read on every click)."""
+    """Load every pickled pipeline ONCE (cache = no re-read on every click).
+    The best model (chosen by cross-validation) is listed first."""
     loaded = {}
-    for file_name in ["best_model.pkl", "second_model.pkl"]:
-        path = os.path.join(MODELS_DIR, file_name)
-        if os.path.exists(path):
-            with open(path, "rb") as f:
-                loaded[file_name] = pickle.load(f)
-    return loaded
+    for path in sorted(glob.glob(os.path.join(MODELS_DIR, "*.pkl"))):
+        with open(path, "rb") as f:
+            bundle = pickle.load(f)
+        loaded[bundle["model_name"]] = bundle
+    return dict(sorted(loaded.items(), key=lambda kv: not kv[1].get("is_best")))
 
 
 models = load_models()
@@ -56,7 +65,6 @@ if not models:
     st.error("No trained models found. Run first:\n\n`python src/train_and_evaluate.py`")
     st.stop()
 
-st.set_page_config(page_title="Loan Approval Prediction", page_icon="🏦", layout="wide")
 st.title("🏦 AI-Based Loan Approval Prediction System")
 st.caption("Predict whether a loan application is likely to be Approved or Rejected.")
 
@@ -85,7 +93,7 @@ with st.form("applicant_form"):
                                              min_value=0, value=1500, step=100)
         loan_amount = st.number_input("Loan amount (in thousands)",
                                       min_value=1, value=130, step=10)
-        loan_term = st.number_input("Loan term (days)",
+        loan_term = st.number_input("Loan term (months)",
                                     min_value=12, value=360, step=12)
         property_area = st.selectbox("Property area", ["Urban", "Semiurban", "Rural"])
 
@@ -101,7 +109,7 @@ if submitted:
     if loan_amount < 1:
         validation_errors.append("Loan amount must be at least 1 (thousand).")
     if loan_term < 12:
-        validation_errors.append("Loan term must be at least 12 days.")
+        validation_errors.append("Loan term must be at least 12 months.")
     
     if validation_errors:
         for error in validation_errors:
@@ -125,19 +133,29 @@ if submitted:
     }])[FEATURE_ORDER]
 
     st.subheader("Model predictions")
-    col_lr, col_dt = st.columns(2)
+    columns = st.columns(len(models))
 
-    for column, (file_name, bundle) in zip([col_lr, col_dt], sorted(models.items())):
+    for column, (name, bundle) in zip(columns, models.items()):
         pipeline = bundle["model"]
-        name = bundle["model_name"]
         prediction = pipeline.predict(input_df)[0]            # 'Y' or 'N'
         prob_y = pipeline.predict_proba(input_df)[0][1]       # P(approved)
 
         with column:
+            if bundle.get("is_best"):
+                st.caption("⭐ Selected model (best 5-fold CV F1)")
             if prediction == "Y":
                 st.success(f"✅ {name}: **APPROVED** ({prob_y:.0%} confidence)")
             else:
                 st.error(f"❌ {name}: **REJECTED** ({1 - prob_y:.0%} confidence)")
+
+    # the same engineered columns the pipelines build internally
+    engineered = add_engineered_features(input_df).iloc[0]
+    st.subheader("Affordability features (engineered)")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total monthly income", f"₹{engineered['TotalIncome']:,.0f}")
+    m2.metric("Approx. EMI / month", f"₹{engineered['EMI']:,.0f}")
+    m3.metric("Income left after EMI", f"₹{engineered['BalanceIncome']:,.0f}")
+    m4.metric("Loan ÷ monthly income", f"{engineered['LoanToIncome']:.1f}×")
 
     with st.expander("Show the raw applicant row sent to the pipelines"):
         st.dataframe(input_df)
@@ -145,6 +163,6 @@ if submitted:
 st.markdown("---")
 st.caption(
     "Trained on the public Analytics Vidhya / Kaggle loan prediction dataset "
-    "(614 applications). **Academic demonstration only — not an official "
-    "HDFC Bank decision.**"
+    "(614 applications). **Academic demonstration only — not a real "
+    "lending decision.**"
 )

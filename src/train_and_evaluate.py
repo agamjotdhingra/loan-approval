@@ -2,8 +2,10 @@
 train_and_evaluate.py - THE MACHINE LEARNING STAGE
 ==================================================
 PART A: preprocessing (leakage-safe: fitted on TRAIN data only)
-PART B: train Logistic Regression + Decision Tree
-PART C: evaluate both on the held-out test set, pick the real winner
+PART B: train Logistic Regression + Decision Tree + Random Forest
+        (all three see the 11 raw features + 5 engineered ones, features.py)
+PART C: 5-fold cross-validation on the training rows picks the winner,
+        then every model is scored once on the held-out test set
         (no invented numbers - everything below is computed live)
 
 Run from the project root:
@@ -29,6 +31,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
@@ -39,11 +43,13 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.impute import SimpleImputer
+
+from features import ENGINEERED, add_engineered_features
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_PATH = os.path.join(PROJECT_ROOT, "data", "loan_data.csv")
@@ -55,11 +61,13 @@ MODELS_DIR = os.path.join(PROJECT_ROOT, "output", "models")
 # ===========================================================================
 
 # Column groups (defined ONCE here, reused everywhere below).
-# Kept in sync with the dataset inspection: 6 categorical + 5 numeric.
+# 6 categorical + 5 raw numeric + 5 engineered numeric (see features.py).
 CATEGORICAL = ["Gender", "Married", "Dependents", "Education",
                "Self_Employed", "Property_Area"]
-NUMERIC = ["ApplicantIncome", "CoapplicantIncome", "LoanAmount",
-           "Loan_Amount_Term", "Credit_History"]
+RAW_NUMERIC = ["ApplicantIncome", "CoapplicantIncome", "LoanAmount",
+               "Loan_Amount_Term", "Credit_History"]
+NUMERIC = RAW_NUMERIC + ENGINEERED
+RAW_FEATURES = CATEGORICAL + RAW_NUMERIC
 
 
 def load_and_split(test_size: float = 0.20, seed: int = 42):
@@ -142,9 +150,23 @@ def build_preprocessor() -> ColumnTransformer:
 # ===========================================================================
 # PART B - THE TWO MODELS (each wrapped in its own full pipeline)
 # ===========================================================================
+def make_pipeline(estimator) -> Pipeline:
+    """feature engineering -> preprocessing -> estimator, as ONE object.
+
+    The engineering step is a stateless FunctionTransformer (it learns
+    nothing), so placing it inside the pipeline is leakage-safe and means
+    the app can keep sending plain raw rows.
+    """
+    return Pipeline([
+        ("engineer", FunctionTransformer(add_engineered_features)),
+        ("preprocess", build_preprocessor()),
+        ("model", estimator),
+    ])
+
+
 def build_models() -> "dict[str, Pipeline]":
-    """Both pipelines start with the SAME preprocessing, differing only in
-    the final estimator - a fair head-to-head.
+    """All pipelines share the SAME feature engineering and preprocessing,
+    differing only in the final estimator - a fair head-to-head.
 
     LogisticRegression(max_iter=1000):
       max_iter raises the gradient-descent step budget; 1000 converges
@@ -154,16 +176,21 @@ def build_models() -> "dict[str, Pipeline]":
       depth is the tree's complexity budget. Unbounded trees keep splitting
       until leaves are pure = memorising the training rows (overfitting).
       Four questions deep also stays human-readable.
+
+    RandomForestClassifier(n_estimators=300, max_depth=6, min_samples_leaf=5):
+      an ENSEMBLE of 300 trees, each grown on a random bootstrap sample of
+      rows and a random subset of features; the forest votes. Averaging
+      many different trees cancels out their individual mistakes, which
+      usually beats a single tree. depth/leaf limits keep each tree small.
     """
     return {
-        "Logistic Regression": Pipeline([
-            ("preprocess", build_preprocessor()),
-            ("model", LogisticRegression(max_iter=1000, random_state=42)),
-        ]),
-        "Decision Tree": Pipeline([
-            ("preprocess", build_preprocessor()),
-            ("model", DecisionTreeClassifier(max_depth=4, random_state=42)),
-        ]),
+        "Logistic Regression": make_pipeline(
+            LogisticRegression(max_iter=1000, random_state=42)),
+        "Decision Tree": make_pipeline(
+            DecisionTreeClassifier(max_depth=4, random_state=42)),
+        "Random Forest": make_pipeline(
+            RandomForestClassifier(n_estimators=300, max_depth=6,
+                                   min_samples_leaf=5, random_state=42)),
     }
 
 
@@ -199,13 +226,78 @@ def evaluate_one(name: str, model, X_test, y_test) -> dict:
     }
 
 
+def cross_validate_one(model, X_train, y_train, folds: int = 5) -> dict:
+    """5-fold stratified cross-validation on the TRAINING rows only.
+
+    WHY? One 123-row test set is a single, slightly lucky-or-unlucky draw.
+    CV splits the 491 training rows into 5 parts, trains on 4 and scores
+    on the 5th, five times over. The MEAN is a steadier estimate and the
+    STD shows how much the score wobbles. The test set stays untouched.
+    """
+    cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
+    scores = cross_validate(model, X_train, (y_train == "Y").astype(int), cv=cv,
+                            scoring=["accuracy", "f1", "roc_auc"])
+    return {
+        "CV Accuracy": scores["test_accuracy"].mean(),
+        "CV F1": scores["test_f1"].mean(),
+        "CV F1 std": scores["test_f1"].std(),
+        "CV ROC-AUC": scores["test_roc_auc"].mean(),
+    }
+
+
+def plot_feature_importance(model, name, X_test, y_test) -> pd.Series:
+    """Permutation importance of each RAW input column for one model.
+
+    HOW: shuffle one column of the test set, re-score the model, and see
+    how much ROC-AUC drops. A big drop = the model relied on that column.
+    It works for ANY model and is measured in the units of the metric.
+    (Shuffling ApplicantIncome also breaks TotalIncome, EMI... because the
+    engineered columns are rebuilt inside the pipeline - so each bar is
+    the total value of that raw column, direct + via engineered features.)
+    """
+    result = permutation_importance(model, X_test, y_test, scoring="roc_auc",
+                                    n_repeats=30, random_state=42)
+    importance = pd.Series(result.importances_mean,
+                           index=X_test.columns).sort_values()
+
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    colors = ["#1565c0" if v > 0 else "#9e9e9e" for v in importance.values]
+    ax.barh(importance.index, importance.values, color=colors)
+    ax.axvline(0, color="#444444", linewidth=0.8)
+    ax.set_xlabel("Drop in test ROC-AUC when the column is shuffled")
+    ax.set_title(f"Which inputs matter? (permutation importance, {name})")
+    fig.tight_layout()
+    fig.savefig(os.path.join(PLOTS_DIR, "06_feature_importance.png"), dpi=150)
+    plt.close(fig)
+    return importance.sort_values(ascending=False)
+
+
+def plot_forest_importance(forest_pipeline) -> pd.Series:
+    """Built-in (Gini) importance of the Random Forest, per MODEL column -
+    this view shows the engineered features individually."""
+    names = forest_pipeline.named_steps["preprocess"].get_feature_names_out()
+    names = [n.split("__", 1)[1] for n in names]       # drop 'num__' / 'cat__'
+    importance = pd.Series(
+        forest_pipeline.named_steps["model"].feature_importances_, index=names
+    ).sort_values().tail(12)
+
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    colors = ["#ef6c00" if n in ENGINEERED else "#0e7c7b" for n in importance.index]
+    ax.barh(importance.index, importance.values, color=colors)
+    ax.set_xlabel("Share of total impurity reduction")
+    ax.set_title("Random Forest: top 12 model columns (orange = engineered)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(PLOTS_DIR, "07_forest_importance.png"), dpi=150)
+    plt.close(fig)
+    return importance.sort_values(ascending=False)
+
+
 def main() -> None:
     os.makedirs(PLOTS_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR, exist_ok=True)
 
     # ---------------- PART A ----------------
     X_train, X_test, y_train, y_test = load_and_split()
-    preprocessor = build_preprocessor()
 
     # ---------------- PART B ----------------
     models = build_models()
@@ -213,8 +305,11 @@ def main() -> None:
 
     for name, pipeline in models.items():
         print(f"\n=== Training {name} ===")
+        cv_scores = cross_validate_one(pipeline, X_train, y_train)
+        print(f"5-fold CV on train: F1 = {cv_scores['CV F1']:.3f} "
+              f"± {cv_scores['CV F1 std']:.3f}")
         pipeline.fit(X_train, y_train)            # fit = learn, on TRAIN only
-        results[name] = evaluate_one(name, pipeline, X_test, y_test)
+        results[name] = {**evaluate_one(name, pipeline, X_test, y_test), **cv_scores}
         confusion[name] = confusion_matrix(y_test, y_pred=pipeline.predict(X_test), labels=["N", "Y"])
 
         print(classification_report(y_test, pipeline.predict(X_test),
@@ -231,21 +326,29 @@ def main() -> None:
     print(comparison.round(3).to_string())
     comparison.round(3).to_csv(os.path.join(PLOTS_DIR, "model_comparison.csv"))
 
-    # model selection by ACTUAL results: highest F1 wins (F1 balances
-    # precision and recall, unlike accuracy which a 69/31 imbalance inflates)
-    best_name = comparison["F1-score"].idxmax()
-    print(f"\n=> Selected model (highest test F1): {best_name}")
+    # model selection uses the CROSS-VALIDATED F1 (training rows only), so
+    # the test set is never used to choose - it only reports. F1 balances
+    # precision and recall, unlike accuracy which a 69/31 imbalance inflates.
+    best_name = comparison["CV F1"].idxmax()
+    print(f"\n=> Selected model (highest 5-fold CV F1): {best_name}")
 
-    # save BOTH pipelines so the Streamlit app can load and compare them
-    for filename, name in [("best_model.pkl", best_name),
-                           ("second_model.pkl",
-                            next(n for n in results if n != best_name))]:
+    # save EVERY pipeline so the Streamlit app can compare them side by side
+    for name, pipeline in models.items():
+        filename = name.lower().replace(" ", "_") + ".pkl"
         with open(os.path.join(MODELS_DIR, filename), "wb") as f:
-            pickle.dump({"model_name": name, "model": models[name]}, f)
+            pickle.dump({"model_name": name, "model": pipeline,
+                         "is_best": name == best_name}, f)
         print(f"Saved {name} -> {filename}")
 
+    importance = plot_feature_importance(models[best_name], best_name, X_test, y_test)
+    print(f"\n=== Permutation importance ({best_name}, drop in ROC-AUC) ===")
+    print(importance.round(3).to_string())
+    forest = plot_forest_importance(models["Random Forest"])
+    print("\n=== Random Forest built-in importance (top 12) ===")
+    print(forest.round(3).to_string())
+
     # confusion matrix heatmaps (one panel per model)
-    fig, axes = plt.subplots(1, len(confusion), figsize=(9, 3.8))
+    fig, axes = plt.subplots(1, len(confusion), figsize=(12, 3.8))
     for ax, (name, cm) in zip(np.atleast_1d(axes), confusion.items()):
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, ax=ax,
                     xticklabels=["Pred N", "Pred Y"],
@@ -258,19 +361,20 @@ def main() -> None:
     # grouped metric bars
     metrics = ["Accuracy", "Precision", "Recall", "F1-score", "ROC-AUC"]
     x = np.arange(len(metrics))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(8, 4))
+    width = 0.27
+    fig, ax = plt.subplots(figsize=(10, 4.2))
     for i, (name, row) in enumerate(results.items()):
-        bars = ax.bar(x + (i - 0.5) * width, [row[m] for m in metrics], width, label=name)
-        ax.bar_label(bars, fmt="%.3f", fontsize=8, padding=2)
+        bars = ax.bar(x + (i - 1) * width, [row[m] for m in metrics], width, label=name)
+        ax.bar_label(bars, fmt="%.2f", fontsize=7, padding=2)
     ax.set_xticks(x, metrics)
-    ax.set_ylim(0, 1.05)
+    ax.set_ylim(0, 1.15)
     ax.set_title("Model comparison on the test set")
-    ax.legend(loc="lower right")
+    ax.legend(loc="upper center", ncol=3, frameon=False)
     fig.tight_layout()
     fig.savefig(os.path.join(PLOTS_DIR, "05_model_comparison.png"), dpi=150)
     plt.close(fig)
-    print(f"\nCharts refreshed: 04_confusion_matrices.png, 05_model_comparison.png")
+    print("\nCharts refreshed: 04_confusion_matrices.png, 05_model_comparison.png, "
+          "06_feature_importance.png, 07_forest_importance.png")
 
 
 if __name__ == "__main__":
